@@ -1,1 +1,1 @@
-from .admin import Administrator
+from .admin import AdminShell

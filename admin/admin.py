@@ -1,4 +1,5 @@
-from datetime import datetime
+import cmd2
+from config import Config
 from getpass import getpass
 import json
 import logging
@@ -6,19 +7,38 @@ from platform import system
 import requests
 
 
-class Administrator:
-    def __init__(self, commanderServer, logLevel):
+def noargs(command):
+    def wrapper(self, args):
+        if args:
+            self.perror('This command takes no arguments')
+        else:
+            command(self)
+    return wrapper
+
+
+def RequestError(Exception):
+    pass
+
+
+class AdminShell(cmd2.Cmd):
+    def __init__(self, completekey='tab', stdin=None, stdout=None, commanderServer="", logLevel=4):
+        super().__init__(completekey, stdin, stdout)
         self.log = self.logInit(logLevel)
         self.commanderServer = commanderServer
-        self.clientCert = ("adminCert.crt", "adminKey.pem")
         self.serverCert = "commander.crt"
-        self.username, self.authToken = self.getAuth()
+        self.username, self.authToken = self.login(0)
         self.headers = {"Content-Type": "application/json",
                         "Username": self.username,
                         "Auth-Token": self.authToken}
+        # TODO: cache hosts and groups locally for tab completion
+        # set prompt experience
+        self.hostgroup = []
+        self.intro = f"Welcome to the {Config.APP_NAME} admin shell. Type help or ? to list commands."
+        self.prompt = f"{self.username}@{Config.APP_NAME.lower()}> "
 
+    # ----- Helper Functions -----
     def request(self, method, directory, body=None, headers=None, files=None):
-        """ HTTPS request to Commander server using client and server verification """
+        """ HTTPS request to the server using client and server verification """
         if headers is None:
             headers = self.headers
         if body is None:
@@ -28,184 +48,37 @@ class Administrator:
         if method == "GET":
             response = requests.get(f"https://{self.commanderServer}{directory}",
                                     headers=headers,
-                                    cert=self.clientCert,
                                     verify=self.serverCert,
                                     data=body)
         elif method == "POST":
             response = requests.post(f"https://{self.commanderServer}{directory}",
                                      headers=headers,
-                                     cert=self.clientCert,
                                      verify=self.serverCert,
                                      data=body,
                                      files=files)
         elif method == "PUT":
             response = requests.put(f"https://{self.commanderServer}{directory}",
                                     headers=headers,
-                                    cert=self.clientCert,
                                     verify=self.serverCert,
                                     data=body,
                                     files=files)
         elif method == "DELETE":
             response = requests.delete(f"https://{self.commanderServer}{directory}",
                                        headers=headers,
-                                       cert=self.clientCert,
                                        verify=self.serverCert,
                                        data=body,
                                        files=files)
-        else:  # method == "PATCH":
+        elif method == "PATCH":
             response = requests.patch(f"https://{self.commanderServer}{directory}",
                                       headers=headers,
-                                      cert=self.clientCert,
                                       verify=self.serverCert,
                                       data=body,
                                       files=files)
+        if "error" in response.json():
+            self.perror(f"Error submitting request: {response.json()['error']}\n")
+            self.perror("Please try again.")
+            raise RequestError()
         return response
-
-    def getAuth(self):
-        """ Fetch authentication token, or login and get one if no valid token is found """
-        try:
-            with open("token.json", "r") as authFile:
-                creds = json.loads(authFile.read())
-            if not creds:
-                raise FileNotFoundError
-            if not creds.authToken[0] or datetime.strptime(creds.authToken[1], "%m/%d/%Y, %H:%M:%S") < datetime.utcnow():
-                creds = self.login(creds.username)
-                with open("token.json", "w") as authFile:
-                    authFile.write(json.dumps(creds))
-        except FileNotFoundError:
-            creds = self.login()
-            self.resetPassword()
-        return creds.username, creds.authToken
-
-    def login(self, username=None):
-        """ Login to Commander server and get new authentication token """
-        if username:
-            print("Authentication token not found or expired.")
-            print(f"Please enter password for '{username}' to get a new token.")
-        else:
-            username = input("Username: ")
-        password = getpass("Password: ")
-        response = self.request("GET", "/admin/login",
-                                headers={"Content-Type": "application/json"},
-                                body={"Username": username, "Password": password})
-        if "error" in response.json():
-            print(f"Error submitting request: {response.json()['error']}")
-            print("Please try again.")
-            creds = self.login()
-        else:
-            creds = response.json()
-        return creds
-
-    def resetPassword(self):
-        """ Reset password in Commander server for logged in user """
-        print(f"Resetting password for '{self.username}'")
-        currentPassword = getpass("Current password: ")
-        newPassword = getpass("New password: ")
-        confirm = getpass("Confirm new password: ")
-        while newPassword != confirm:
-            print("Passwords do not match, please try again.")
-            newPassword = getpass("New password: ")
-            confirm = getpass("Confirm new password: ")
-        response = self.request("PATCH", "/admin/login",
-                                body={"username": self.username,
-                                      "current": currentPassword,
-                                      "new": newPassword})
-        if "error" in response.json():
-            print(f"Error submitting request: {response.json()['error']}")
-            print("Please try again.")
-        else:
-            print(f"Successfully changed password for '{self.username}'")
-
-    def generateRegistrationKey(self):
-        """ Reset and fetch registration key to register new clients """
-        response = self.request("GET", "/admin/generate-registration-key")
-        if "error" in response.json():
-            print(f"Error submitting request: {response.json()['error']}")
-            print("Please try again.")
-        else:
-            print(f"Registration Key: {response.json()['registration-key']}")
-
-    def executionRequest(self, hostname, filename):
-        """ Send a file from the Commander library to the given host and execute it """
-        response = self.request("POST", "/agent/jobs",
-                                body={"hostname": hostname,
-                                      "filename": filename})
-        if "error" in response.json():
-            print(f"Error submitting request: {response.json()['error']}")
-            print("Please try again.")
-        else:
-            print("Successfully submitted execution request.")
-
-    def getExecutionLibrary(self):
-        """ Receive the execution library from Commander and format output """
-        response = self.request("GET", "/admin/library")
-        if "error" in response.json():
-            print(f"Error submitting request: {response.json()['error']}")
-            print("Please try again.")
-        else:
-            library = json.loads(response.json())
-            for executable in library:
-                print(f"<-- {executable['fileName']} -->")
-                print(f"Submitted by: {executable['user']} on {executable['timeSubmitted']}")
-                print(f"Description: {executable['description']}")
-
-    def newExecutable(self, filePath, description=""):
-        """ Upload a new executable to the Commander library """
-        if "/" in filePath:
-            filename = filePath[filePath.rindex("/"):]
-        elif "\\" in filePath:
-            filename = filePath[filePath.rindex("\\"):]
-        else:
-            filename = filePath
-        try:
-            with open(filePath, "r") as executable:
-                response = self.request("POST", "/admin/library",
-                                        files={"executable": executable},
-                                        body={"filename": filename,
-                                              "description": description})
-                if "error" in response.json():
-                    print(f"Error submitting request: {response.json()['error']}")
-                    print("Please try again.")
-                else:
-                    print(f"Successfully added {filename} to the Commander library.")
-        except FileNotFoundError:
-            print("File not found, please check file path and try again.")
-
-    def deleteExecutable(self, filename):
-        """ Delete an executable from the Commander library """
-        response = self.request("DELETE", "/admin/library",
-                                body={"filename": filename})
-        if "error" in response.json():
-            print(f"Error submitting request: {response.json()['error']}")
-            print("Please try again.")
-        else:
-            print(f"Successfully deleted {filename} from the Commander library.")
-
-    def updateExecutable(self, filename, filePath):
-        """ Upload an updated version of an executable to the Commander library """
-        try:
-            with open(filePath, "r") as executable:
-                response = self.request("PATCH", "/admin/library",
-                                        files={"executable": executable},
-                                        body={"filename": filename})
-                if "error" in response.json():
-                    print(f"Error submitting request: {response.json()['error']}")
-                    print("Please try again.")
-                else:
-                    print(f"Successfully updated {filename} in the Commander library.")
-        except FileNotFoundError:
-            print("File not found, please check file path and try again.")
-
-    def updateDescription(self, filename, description):
-        """ Update the description of an executable in the Commander library """
-        response = self.request("PATCH", "/admin/library",
-                                body={"filename": filename,
-                                      "description": description})
-        if "error" in response.json():
-            print(f"Error submitting request: {response.json()['error']}")
-            print("Please try again.")
-        else:
-            print(f"Successfully updated the description of {filename} in the Commander library.")
 
     def logInit(self, logLevel):
         """ Configure log level (1-5) and OS-dependent log file location """
@@ -229,3 +102,279 @@ class Administrator:
         handler.setFormatter(formatter)
         log.addHandler(handler)
         return log
+
+    def login(self, tries):
+        """ Login to the server and get new authentication token """
+        if tries == 3:
+            self.perror("Too many failed login attempts. Exiting...")
+            exit(1)
+        username = input("Username: ")
+        password = getpass("Password: ")
+        try:
+            response = self.request("GET", "/admin/login",
+                                    headers={"Content-Type": "application/json"},
+                                    body={"Username": username, "Password": password})
+            creds = response.json()
+        except RequestError:
+            creds = self.login(tries+1)
+        return creds["username"], creds["authToken"]
+    
+    # ----- State Management Commands -----
+    
+    def do_set(self, hosts):
+        """
+        Select the specified host(s) for use with future commands:\n\t\
+            set <host>|<hostgroup> ... <host>|<hostgroup>
+        """
+        for arg in hosts.arg_list:
+            if arg == "all":
+                self.hostgroup = ["all"]
+                return
+            self.hostgroup.append(arg)
+    
+    def do_unset(self, hosts):
+        """
+        Unselect all hosts or the specified host(s):\n\t\
+            unset [<host>|<hostgroup> ... <host>|<hostgroup>]
+        """
+        if not hosts:
+            self.hostgroup = []
+            return
+        for host in hosts.arg_list:
+            if host in self.hostgroup:
+                try:
+                    self.hostgroup.remove(host)
+                except ValueError:
+                    print(f"Warning: {host} not found in hostgroup. Skipping...")
+                 
+    @noargs   
+    def do_hosts(self, args):
+        """ List selected hosts:\n\thosts """
+        for host in self.hostgroup:
+            print(host)
+
+    # ----- Account Management Commands -----
+    def do_passwd(self, username=""):
+        """
+        Reset the admin password for the given user:
+            passwd [<username>]
+        """
+        if not username:
+            username = self.username
+        print(f"Resetting password for '{username}'")
+        currentPassword = getpass("Current password: ")
+        newPassword = getpass("New password: ")
+        confirm = getpass("Confirm new password: ")
+        while newPassword != confirm:
+            print("Passwords do not match, please try again.")
+            newPassword = getpass("New password: ")
+            confirm = getpass("Confirm new password: ")
+        response = self.request("PATCH", "/admin/login",
+                                body={"username": self.username,
+                                      "current": currentPassword,
+                                      "new": newPassword})
+        if "error" in response.json():
+            print(f"Error submitting request: {response.json()['error']}")
+            print("Please try again.")
+        else:
+            print(f"Successfully changed password for '{self.username}'")
+            
+    def do_useradd(self, username):
+        """
+        Add a new admin user:\n\t\
+            useradd <username>
+        """
+        pass
+    
+    def do_userdel(self, username):
+        """
+        Delete an admin user:\n\t\
+            userdel <username>
+        """
+        pass
+
+    # ----- Agent Install Commands -----
+    @noargs
+    def do_regkey(self, args):
+        """
+        Reset and fetch registration key to register new clients:\n\t\
+            regkey
+        """
+        response = self.request("GET", "/admin/registration-key")
+        if "error" in response.json():
+            print(f"Error submitting request: {response.json()['error']}")
+            print("Please try again.")
+        else:
+            print(f"Registration Key: {response.json()['registration-key']}")
+
+    @noargs
+    def do_newregkey(self, args):
+        """
+        Reset and fetch registration key to register new clients:\n\t\
+            newregkey
+        """
+        response = self.request("PUT", "/admin/registration-key")
+        if "error" in response.json():
+            print(f"Error submitting request: {response.json()['error']}")
+            print("Please try again.")
+        else:
+            print(f"Registration Key: {response.json()['registration-key']}")
+            
+    def do_installer(self, version="latest"):
+        """
+        List agent installers or fetch one (default is latest version):\n\t\
+            installer [list|<version>]
+        """
+        pass
+
+    # ----- Job Management Commands -----
+    def do_execute(self, filename):
+        """
+        Send a file from the library to the selected host(s) and execute it\n\t\
+            execute <filename>
+        """
+        print(f"Assigning {filename} to {', ' .join(self.hostgroup)}...")
+        print("Failed hostnames will be sent to stderr and successes to stdout.")
+        for hostname in self.hostgroup:
+            try:
+                response = self.request("POST", "/agent/jobs",
+                                        body={"hostname": hostname,
+                                              "filename": filename})
+            except RequestError:
+                self.perror(hostname)
+            else:
+                self.poutput(hostname)
+            
+    def do_search(self, args):
+        """
+        Search for jobs:\n\t\
+            search hosts|groups|library|results <query>
+        """
+        pass
+    
+    def do_history(self, number):
+        """
+        Fetch the entire job history for the selected hosts, or specify the number of jobs to return:\n\t\
+            history [<number>]
+        """
+        pass
+    
+    @noargs
+    def do_results(self, args):
+        """
+        Fetch most recent job on all selected hosts:\n\t\
+            results
+        """
+        pass
+    
+    def do_job(self, jobID):
+        """
+        Fetch the details of the specified job:\n\t\
+            job <jobID>
+        """
+        pass
+
+    @noargs
+    def do_library(self, args):
+        """
+        Receive the execution library from the server and format output:\n\t\
+            library
+        """
+        response = self.request("GET", "/admin/library")
+        library = response.json()["library"]
+        for executable in library:
+            print(f"<-- {executable['fileName']} -->")
+            print(f"Submitted by: {executable['user']} on {executable['timeSubmitted']}")
+            print(f"Description: {executable['description']}")
+            
+    def do_bundle(self, filename):
+        """
+        Bundle an executable into the expect jobfile format:\n\t\
+            bundle <filename>
+        """
+        pass
+
+    def do_addjob(self, filePath, description=""):
+        """
+        Upload a new executable package to the library:\n\t\
+            addjob <path> [description]
+        """
+        if "/" in filePath:
+            filename = filePath[filePath.rindex("/"):]
+        elif "\\" in filePath:
+            filename = filePath[filePath.rindex("\\"):]
+        else:
+            filename = filePath
+        try:
+            with open(filePath, "r") as executable:
+                response = self.request("POST", "/admin/library",
+                                        files={"executable": executable},
+                                        body={"filename": filename,
+                                              "description": description})
+                if "error" in response.json():
+                    print(f"Error submitting request: {response.json()['error']}")
+                    print("Please try again.")
+                else:
+                    print(f"Successfully added {filename} to the Commander library.")
+        except FileNotFoundError:
+            print("File not found, please check file path and try again.")
+
+    def do_rmjob(self, filename):
+        """
+        Delete an executable from the library:\n\t\
+            rmjob <filename>
+        """
+        response = self.request("DELETE", "/admin/library",
+                                body={"filename": filename})
+        if "error" in response.json():
+            print(f"Error submitting request: {response.json()['error']}")
+            print("Please try again.")
+        else:
+            print(f"Successfully deleted {filename} from the library.")
+
+    def do_modjob(self, filename="", filePath="", description=""):
+        """
+        Update the description or file version of an job in the library:\n\t\
+            modjob <filename> <filepath>|<description>
+        """
+        # TODO: fix argument parsing
+        try:
+            with open(filePath, "r") as executable:
+                response = self.request("PATCH", "/admin/library",
+                                        files={"executable": executable},
+                                        body={"filename": filename})
+                if "error" in response.json():
+                    print(f"Error submitting request: {response.json()['error']}")
+                    print("Please try again.")
+                else:
+                    print(f"Successfully updated {filename} in the Commander library.")
+        except FileNotFoundError:
+            print("File not found, please check file path and try again.")
+            
+    # ----- Record and Playback -----
+    def do_record(self, outfile):
+        """
+        Save future commands to filename:\n\t\
+            record <outfile>.cmdr
+        """
+        self.file = open(outfile, 'w')
+
+    def do_playback(self, infile):
+        """
+        Playback commands from a file:\n\t\
+            playback <infile>.cmdr
+        """
+        self.close()
+        with open(infile) as f:
+            self.cmdqueue.extend(f.read().splitlines())
+
+    def precmd(self, line):
+        line = line.lower()
+        if self.file and 'playback' not in line:
+            print(line, file=self.file)
+        return line
+    
+    def close(self):
+        if self.file:
+            self.file.close()
+            self.file = None
